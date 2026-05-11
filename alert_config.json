@@ -1,1 +1,6 @@
-{"max_temp": 20.0, "alarm_enabled": true}
+{
+  "max_temp": 20.0,
+  "alarm_enabled": true,
+  "token": "PuKtYxi2Kv4GQflp4WdqHUl73M9aBdPIRYnUc5LpQSkyxBlM",
+  "wechat_webhook": ""
+}

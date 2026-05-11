@@ -2,7 +2,7 @@
 from collections import defaultdict  # 用于 IP 频率限制的数据结构（自动为每个 IP 创建独立的计时列表）
 from typing import Optional  # 类型注解：声明可选字段
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request  # FastAPI 框架 + 认证依赖注入 + 请求对象
+from fastapi import Depends, FastAPI, HTTPException, Request  # FastAPI 框架 + 认证依赖注入 + 请求对象
 from fastapi.middleware.cors import CORSMiddleware  # 解决跨域问题，让前端能请求我们
 from pydantic import BaseModel, Field  # Pydantic：为 POST 接口做请求体校验，防止注入攻击
 
@@ -17,8 +17,9 @@ ALERT_CONFIG_FILE = "alert_config.json"  # 报警配置就存在这个文件里
 DEFAULT_CONFIG = {
     "max_temp": 30.0,  # 温度超过此值触发报警
     "alarm_enabled": True,  # 报警总开关（修复：统一使用 alarm_enabled 字段名）
-    "token": "changeme",  # 【安全加固】API 认证令牌 —— 生产环境请务必修改为强随机字符串
+    "token": "",  # 【安全加固】默认空 token，生产环境须在 alert_config.json 中设置强随机令牌
     "wechat_webhook": "",  # 【安全加固】企业微信 Webhook 地址存配置文件，不硬编码在代码中
+    "allowed_origins": ["*"],  # 【安全加固】CORS 允许的源，生产环境请改为具体域名如 ["https://dashboard.example.com"]
 }
 # 单独定义一个 DEFAULT_CONFIG，是为了当配置文件被误删或损坏时，系统会自动用这套默认值重建，不会崩溃（默认值兜底）
 
@@ -50,26 +51,25 @@ def check_rate_limit(request: Request):
     rate_records[ip].append(now)  # 记录本次请求时间戳
 
 
-# ==================== API Token 认证 ====================
-def verify_token(request: Request, token: Optional[str] = Query(None)):
-    """【安全加固】API Token 认证依赖 —— 校验请求中的令牌是否与配置文件中的一致。
-    支持两种传参方式（优先级从高到低）：
-      1. URL 查询参数  ?token=xxx
-      2. HTTP Authorization 头部  Authorization: Bearer xxx
+# ==================== API Token 认证（仅 Bearer 头） ====================
+def verify_token(request: Request):
+    """【安全加固】Bearer Token 认证依赖。
+    仅接受 Authorization: Bearer <token> 头部（不再支持 URL 查询参数，避免 token 泄露到日志）。
+    若配置文件未设置 token（空字符串），直接拒绝所有请求，防止空 token 绕过认证。
     认证失败时抛出 HTTP 401 状态码。"""
     config = load_config()
     expected = config.get("token", "")
 
-    # 方式 1：URL 查询参数（GET 请求在浏览器中直接测试最方便）
-    if token and token == expected:
-        return True
+    # 【安全加固】空 token 直接拒绝，防止 Authorization: Bearer  绕过认证
+    if not expected:
+        raise HTTPException(status_code=500, detail="服务器未配置认证令牌，请联系管理员")
 
-    # 方式 2：Authorization: Bearer <token> 头部（生产环境推荐）
+    # 仅接受 Bearer 头部
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer ") and auth[7:] == expected:
         return True
 
-    # 两种方式都不匹配 —— 拒绝访问（使用通用错误消息，不泄露内部细节）
+    # 认证失败（使用通用错误消息，不泄露内部细节）
     raise HTTPException(status_code=401, detail="认证失败")
 
 
@@ -86,10 +86,11 @@ class AlertConfigUpdate(BaseModel):
 # 2.创建一个"应用"
 app = FastAPI(title="智能环境哨兵 API", version="2.0")
 
-# 3.允许跨域访问（后续收敛到具体前端域名会更安全，开发阶段用 *）
+# 3.允许跨域访问（从配置文件读取 allowed_origins，生产环境请改为具体域名）
+origins = load_config().get("allowed_origins", ["*"])
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,  # 【安全加固】从配置文件读取，不再硬编码 *
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -153,13 +154,15 @@ def get_latest():
 @app.get("/api/alert_config")
 def get_alert_config(_: bool = Depends(verify_token)):
     """读取当前报警阈值配置，返回给前端。
-    【安全加固】需要 ?token=xxx 或 Authorization: Bearer xxx 认证。"""
+    【安全加固】需要 Authorization: Bearer <token> 认证。"""
     try:
         config = load_config()
         # 【安全加固】返回配置前脱敏：不暴露 token 的完整值，只返回是否已配置
         safe_config = dict(config)
         if safe_config.get("token"):
-            safe_config["token"] = "***"  # 掩码处理，防止 token 二次泄露
+            safe_config["token"] = "***"
+        if safe_config.get("wechat_webhook"):
+            safe_config["wechat_webhook"] = "***"  # 掩码处理，防止 webhook 地址泄露
         return safe_config
     except Exception:
         return {"error": "读取配置失败"}
@@ -202,6 +205,8 @@ def set_alert_config(
         safe_config = dict(config)
         if safe_config.get("token"):
             safe_config["token"] = "***"
+        if safe_config.get("wechat_webhook"):
+            safe_config["wechat_webhook"] = "***"  # POST 接口返回也做脱敏
         return {"status": "ok", "config": safe_config}
 
     except Exception:
@@ -255,10 +260,15 @@ def get_alert_message():
 if __name__ == "__main__":
     import uvicorn
 
-    # uvicorn.run 启动服务器
-    # app 是我们要运行的应用
-    # host = "0.0.0.0" 让同一个 wifi 下的其他设备也能访问
-    # port = 8000 端口号
+    # host="0.0.0.0" 让局域网设备可访问; port=8000 端口号
+    #
+    # 【安全加固】生产环境务必通过 Nginx/Caddy 反向代理添加 HTTPS，否则 token 明文传输。
+    # 若必须由 uvicorn 直接提供 HTTPS，取消下面注释并签发证书：
+    # uvicorn.run(app, host="0.0.0.0", port=8000,
+    #             ssl_keyfile="/path/to/privkey.pem",
+    #             ssl_certfile="/path/to/fullchain.pem")
+    #
+    # 开发 / 内网环境：
     uvicorn.run(app, host="0.0.0.0", port=8000)
 
 
